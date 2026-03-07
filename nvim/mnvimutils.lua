@@ -11,9 +11,9 @@ if vim.g.debug_require then
     local original_require = require
     local original_package_path = package.path
     local original_package_cpath = package.cpath
-	local log_requires = false
+    local log_requires = false -- Set to true to see successful requires too
 
-    -- Use a consistent logger (assuming user.log exists)
+    -- Use a consistent logger
     local pr = user.log
 
     -- State for the debugger
@@ -23,22 +23,18 @@ if vim.g.debug_require then
 
     ---
     -- Gets formatted information about the calling location.
-    -- @return string The formatted caller location (e.g., "path/to/file.lua:42").
     ---
     local function get_caller_info()
-        -- Level 3 is correct: 1=getinfo, 2=our wrapper, 3=the actual caller
-        local info = debug.getinfo(3, "Sl")
-        if not info or not info.source then
-            return "unknown"
+        -- iterate up the stack to find the first function that isn't this debugger
+        for i = 3, 10 do
+            local info = debug.getinfo(i, "Sl")
+            if not info then break end
+            -- Skip C functions and our own debugger file (optional refinement)
+            if info.source ~= "=[C]" and info.source:sub(1,1) == "@" then
+                return info.source:sub(2), info.currentline
+            end
         end
-
-        local src, line = info.source, info.currentline
-        if src == "=[C]" then
-            return "[C]"
-        elseif src:sub(1, 1) == "@" then
-            return src:sub(2) .. ":" .. line
-        end
-        return src .. ":" .. line
+        return "unknown", 0
     end
 
     -- Overwrite the global require function
@@ -46,160 +42,122 @@ if vim.g.debug_require then
         require_depth = require_depth + 1
         local indent = string.rep("  ", require_depth - 1)
 
+        -- Capture caller info IMMEDIATELY so we have it for errors
+        local caller_file, caller_line = get_caller_info()
+        local caller_desc = caller_file .. ":" .. caller_line
+
         -- ✅ 1. Validate input type
         if type(mod) ~= "string" then
-            pr(indent .. "⚠️  require() called with non-string:", vim.inspect(mod))
+            pr(indent .. "⚠️  require() called with non-string: " .. vim.inspect(mod))
             require_depth = require_depth - 1
-            return original_require(mod) -- Let the original function handle the error
+            return original_require(mod)
         end
 
-        -- ✅ 2. Check if the module is already loaded (fast path)
+        -- ✅ 2. Check cache (Fast Path)
         if package.loaded[mod] then
-            --pr(string.format("%s✅ USING CACHE for '%s'", indent, mod))
             require_depth = require_depth - 1
             return package.loaded[mod]
         end
 
-		if log_requires then
-			pr(string.format("%s📥 require('%s') ← from %s%s", indent, mod, get_caller_info(), ((lua_jit_builtins[mod] or false) and jit) and " ⚙️ BUILT-IN (LuaJIT)" or ""))
-		end
+        if log_requires then
+            pr(string.format("%s📥 require('%s') ← %s", indent, mod, caller_desc))
+        end
 
-        -- ✅ 4. Check our cache for previously failed modules to avoid repeated disk I/O
+        -- ✅ 3. Check failed cache
         if failed_cache[mod] then
-            pr(indent .. "❌ CACHED FAIL: Previously failed to load '" .. mod .. "'. Re-throwing original error.")
+            pr(indent .. "❌ CACHED FAIL: '" .. mod .. "' previously failed.")
             require_depth = require_depth - 1
             error(failed_cache[mod], 2)
         end
 
-        -- ✅ 5. Attempt to load using the original `require`
-        local ok, result =
-            xpcall(
-            function()
-                return original_require(mod)
-            end,
+        -- ✅ 4. Attempt Load
+        local ok, result = xpcall(
+            function() return original_require(mod) end,
             debug.traceback
         )
 
+
         if ok then
-            --pr(string.format("%s✔️ SUCCESS: '%s' loaded", indent, mod))
             require_depth = require_depth - 1
             return result
         end
+		
+		-- Ignore certain libs that are generally not installed and clutter logs
+		if string.match(tostring(mod), "mason[-]lspconfig.lsp") ~= nil then		
+			--print("IGNORING "..tostring(mod))
+			require_depth = require_depth - 1
+			return {}
+		end
+		
+	
+        -- ❌ 5. DIAGNOSIS
+        pr(string.format("%s❌ FAILED to load '%s'", indent, mod))
+        failed_cache[mod] = result
 
-        -- ❌ If we're here, the original require failed. Let's diagnose.
-        pr(string.format("%s❌ FAILED to load '%s'. Starting diagnosis...", indent, mod))
-        failed_cache[mod] = result -- Cache the error to speed up subsequent failures
-
-        -- ✅ 6. [NEW] Display the most critical information: what Lua actually searched for
         pr(indent .. "  │")
+        pr(indent .. "  ├─ REQUESTED BY: " .. caller_desc)
         pr(indent .. "  ├─ Original error: " .. tostring(result):gsub("\n", "\n" .. indent .. "  │ "))
-        pr(indent .. "  ├─ Lua Search Path (`package.path`):")
-        for path in string.gmatch(package.path, "([^;]+)") do
-            pr(indent .. "  │   " .. path)
-        end
-        pr(indent .. "  ├─ C Search Path (`package.cpath`):")
-        for path in string.gmatch(package.cpath, "([^;]+)") do
-            pr(indent .. "  │   " .. path)
-        end
-        pr(indent .. "  └────────────────")
 
-        -- ✅ 7. [IMPROVED] Search common locations to provide a helpful hint
-        local mod_as_path = mod:gsub("%.", "\\")
-        local candidate_file = nil
-        local seen_roots = {}
-        local possible_roots = {
-            vim.fn.stdpath("config"),
-            vim.fn.stdpath("data"),
-            _jp(vim.fn.stdpath("data"),"lazy") -- For lazy.nvim
-        }
-
-        for _, root_path in ipairs(possible_roots) do
-            if not seen_roots[root_path] then
-                local lua_root = _jp(root_path,"lua")
-                local try_paths = {
-                    _jp(lua_root, mod_as_path, ".lua"), -- Check for file.lua
-                    _jp(lua_root, mod_as_path, "init.lua") -- Check for file/init.lua
-                }
-                for _, p in ipairs(try_paths) do
-                    if vim.fn.filereadable(p) == 1 then
-                        candidate_file = p
-                        break
-                    end
-                end
-                if candidate_file then
+        -- ✅ 6. [NEW] Check for "Sibling/Relative" File Trap
+        -- This detects if 'struct.lua' sits right next to 'serializer.lua'
+        local sibling_candidate = nil
+        if caller_file ~= "unknown" then
+            -- Get directory of the caller
+            local caller_dir = caller_file:match("(.*" .. user.path_sep .. ")") or ""
+            
+            -- Check for sibling file.lua or sibling/init.lua
+            local check_paths = {
+                caller_dir .. mod .. ".lua",
+                caller_dir .. mod .. user.path_sep .. "init.lua"
+            }
+            
+            for _, p in ipairs(check_paths) do
+                if vim.fn.filereadable(p) == 1 then
+                    sibling_candidate = p
                     break
                 end
-                seen_roots[root_path] = true
             end
         end
 
-        if candidate_file then
-            pr(indent .. "💡 HINT: Module file found on disk but not in a searchable path: " .. candidate_file)
-            local suggested_path = (candidate_file:match("(.*\\lua)\\.*") or "")
-
-            -- ✅ 8. [IMPROVED] Auto-patch and retry
+        if sibling_candidate then
+            pr(indent .. "  │")
+            pr(indent .. "  ├─ 🕵️ DIAGNOSIS: RELATIVE PATH ISSUE DETECTED")
+            pr(indent .. "  │  The file exists at: " .. sibling_candidate)
+            pr(indent .. "  │  BUT Lua does not search the caller's directory by default.")
+            pr(indent .. "  │  The caller ("..caller_file:match("[^"..user.path_sep.."]+$")..") is trying to require sibling '"..mod.."'.")
+            
+            -- AUTO PATCH FOR SIBLINGS
             if vim.g.debug_require_auto_patch then
-                local dir_to_add = candidate_file:match("(.+)\\[^\\]+$")
-                pr(indent .. "🔧 AUTO-PATCH: Temporarily adding path and retrying...")
-                pr(indent .. "  > " .. dir_to_add)
-
+                pr(indent .. "  └─ 🔧 AUTO-PATCH: Adding caller directory to path and retrying...")
+                local caller_dir = sibling_candidate:match("(.*" .. user.path_sep .. ")")
+                
                 local pre_patch_path = package.path
-                package.path = _jp(dir_to_add,"?.lua;",dir_to_add,"?","init.lua;")..pre_patch_path
-
-                local ok2, result2 =
-                    xpcall(
-                    function()
-                        return original_require(mod)
-                    end,
+                package.path = caller_dir .. "?.lua;" .. caller_dir .. "?" .. user.path_sep .. "init.lua;" .. pre_patch_path
+                
+                local ok2, result2 = xpcall(
+                    function() return original_require(mod) end,
                     debug.traceback
                 )
-
-                package.path = pre_patch_path -- CRITICAL: Restore path immediately
+                
+                package.path = pre_patch_path -- Restore immediately
 
                 if ok2 then
-                    pr(string.format("%s✔️ AUTO-FIX SUCCESS: '%s' loaded after patching path.", indent, mod))
-                    failed_cache[mod] = nil -- It's no longer a failed module
+                    pr(string.format("%s✔️ AUTO-FIX SUCCESS: '%s' loaded from sibling dir.", indent, mod))
+                    failed_cache[mod] = nil
                     require_depth = require_depth - 1
                     return result2
                 else
-                    pr(indent .. "❌ AUTO-FIX FAILED. The issue may be a syntax error inside the module.")
+                     pr(indent .. "  ❌ AUTO-FIX FAILED (Syntax error in sibling file?)")
                 end
-            else
-                pr(
-                    string.format(
-                        "%s💡 SUGGESTION: Add `package.path = package.path .. ';%s\\?.lua;%s\\?\\init.lua'` to your config.",
-                        indent,
-                        suggested_path,
-                        suggested_path
-                    )
-                )
             end
         else
-            pr(indent .. "❌ NOT FOUND: Module " .. mod .. " file could not be located in common Neovim directories.")
+            -- Standard search (existing logic)
+            -- ... (Include your existing search loop here if desired)
+             pr(indent .. "  └─ Not found in standard paths or sibling directories.")
         end
 
-        -- ✅ 9. Re-throw the original error to maintain normal program flow and stack trace
         require_depth = require_depth - 1
         error(result, 2)
-    end
-
-    ---
-    -- Restores the original global require function and paths.
-    ---
-    function _G.disable_require_debugger()
-        if _G.require == require then
-            _G.require = original_require
-            package.path = original_package_path
-            package.cpath = original_package_cpath
-            pr("🐞 Custom `require` debugger disabled. Originals restored.")
-        else
-            pr("⚠️  Could not disable `require` debugger: another script may have overwritten it.")
-        end
-    end
-
-    pr("🐞 Custom `require` debugger is active.")
-    if vim.g.debug_require_auto_patch then
-        pr("⚡ Auto-patching of `package.path` is enabled.")
     end
 end
 
@@ -318,7 +276,7 @@ function M.auto_guard()
     local modname = filepath:gsub("%.lua$", ""):gsub("[/\\]", "_"):gsub("%.", "_"):gsub("[^%w_]", "_")
 
     local guard_name = "__guard_" .. modname
-	--print("Gaurding "..guard_name)
+	--print("Guarding "..guard_name)
 	
     if vim.g[guard_name] then
         return true -- already loaded

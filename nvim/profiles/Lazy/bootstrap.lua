@@ -16,8 +16,8 @@ local uv = vim.uv or vim.loop
 if vim.env.LAZY_STDPATH then
 	local root = vim.fn.fnamemodify(vim.env.LAZY_STDPATH, ":p"):gsub("[\\/]$", "")
 	for _, name in ipairs({ "config", "data", "state", "cache" }) do
-		vim.env[("XDG_%s_HOME"):format(name:upper())] = root .. "/" .. name
-		user.log("lazy bs = "..vim.env[("XDG_%s_HOME"):format(name:upper())].." = "..root .. "/" .. name)
+		vim.env[("XDG_%s_HOME"):format(name:upper())] = root .. user.path_sep .. name
+		user.log("lazy bs = "..vim.env[("XDG_%s_HOME"):format(name:upper())].." = "..root .. user.path .. name)
 	end
 	vim.env.LAZY_PATH = vim.env.LAZY_STDPATH
 end

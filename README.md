@@ -16,3 +16,7 @@ To create a new profile requires making a profile subdirectory in .config\nvim a
 
 ## Note
 I am very new to neovim. I created this router so I could play with neovim using different profiles. The main purpose was to make it easy to back up neovim without having to deal with a bunch of different subdirectories and to have some way to change those profiles quickly.
+
+# setup
+Make sure to edit CommonSettings.lua and set paths related to your specific setup.
+
